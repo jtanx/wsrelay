@@ -1,0 +1,8 @@
+.vscode/
+_old/
+coverage/
+common/gen_version.go
+common/gen_defs.go
+
+*.exe
+receiver
