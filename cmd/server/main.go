@@ -43,6 +43,13 @@ func (wsr *WSRelay) RemoveConnection(conn *common.WebsocketConn) {
 	wsr.mu.Lock()
 	defer wsr.mu.Unlock()
 
+	for i, c := range wsr.freeConns {
+		if c == conn {
+			wsr.freeConns = append(wsr.freeConns[:i], wsr.freeConns[i+1:]...)
+			log.Infof("Removed conn from free list: %v", conn)
+		}
+	}
+
 	for i, c := range wsr.conns {
 		if c == conn {
 			wsr.conns = append(wsr.conns[:i], wsr.conns[i+1:]...)
@@ -101,7 +108,8 @@ func (wsr *WSRelay) Serve(w http.ResponseWriter, r *http.Request, ps httprouter.
 		return
 	}
 
-	log.Infof("Received connection from %v", conn.RemoteAddr().String())
+	log.Infof("Received connection from %v (headers %v)",
+		conn.RemoteAddr().String(), r.Header)
 	msgType, data, err := conn.ReadMessage()
 	if err != nil {
 		log.Warnf("Failed to read login: %v", err)
@@ -120,8 +128,6 @@ func (wsr *WSRelay) Serve(w http.ResponseWriter, r *http.Request, ps httprouter.
 		return
 	}
 
-	common.SetPongHandler(conn)
-
 	wsr.mu.Lock()
 	defer wsr.mu.Unlock()
 
@@ -136,6 +142,7 @@ func (wsr *WSRelay) Serve(w http.ResponseWriter, r *http.Request, ps httprouter.
 		wsConn := common.NewWebsocketConn(conn, "[srv-%d]", wsr.srvCounter)
 		log.Infof("Accepted receiver conn: %v", wsConn)
 
+		common.SetPongHandler(wsConn)
 		wsr.conns = append(wsr.conns, wsConn)
 		wsr.freeConns = append(wsr.freeConns, wsConn)
 	} else {
@@ -153,10 +160,14 @@ func (wsr *WSRelay) Serve(w http.ResponseWriter, r *http.Request, ps httprouter.
 		srvConn := wsr.freeConns[0]
 		wsr.freeConns = wsr.freeConns[1:]
 		wsConn := common.NewWebsocketConn(conn, "[cli-%d]", wsr.cliCounter)
-
-		wsr.conns = append(wsr.conns, wsConn)
 		log.Infof("Accepted client conn: %v paired with %v",
 			srvConn, wsConn)
+
+		// Need to re-set the read deadline on the server connection as
+		// we haven't been reading off it in the mean time
+		srvConn.Conn.SetReadDeadline(time.Now().Add(common.RWTimeout))
+		common.SetPongHandler(wsConn)
+		wsr.conns = append(wsr.conns, wsConn)
 
 		go wsr.RelayReads(srvConn, wsConn)
 		go wsr.RelayReads(wsConn, srvConn)

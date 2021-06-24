@@ -28,12 +28,16 @@ func ManageHeartbeats(cm ConnectionManager) {
 	}
 }
 
-func SetPongHandler(conn *websocket.Conn) {
-	conn.SetPongHandler(func(string) error {
+func SetPongHandler(conn *WebsocketConn) {
+	conn.Conn.SetPongHandler(func(string) error {
 		deadline := time.Now().Add(RWTimeout)
-		if err := conn.SetWriteDeadline(deadline); err != nil {
+		log.Debugf("PONG on %v, going to set deadline to %v", conn, deadline)
+		if err := conn.Conn.SetWriteDeadline(deadline); err != nil {
+			return err
+		} else if err = conn.Conn.SetReadDeadline(deadline); err != nil {
 			return err
 		}
-		return conn.SetReadDeadline(deadline)
+		log.Debugf("Set read/write deadline to %v: %v", deadline, conn)
+		return nil
 	})
 }

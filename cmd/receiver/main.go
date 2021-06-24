@@ -35,9 +35,11 @@ func (wcp wsConnPair) String() string {
 }
 
 func NewWSConnPair(wsConn *websocket.Conn, wsDesc string, wsDescArgs ...interface{}) *wsConnPair {
-	return &wsConnPair{
+	ret := &wsConnPair{
 		wsConn: common.NewWebsocketConn(wsConn, wsDesc, wsDescArgs...),
 	}
+	common.SetPongHandler(ret.wsConn)
+	return ret
 }
 
 type WSReceiver struct {
@@ -181,7 +183,6 @@ func (wsr *WSReceiver) AddConnection() error {
 		return fmt.Errorf("Failed to connect websocket: %v", err)
 	}
 
-	common.SetPongHandler(conn)
 	conn.SetWriteDeadline(time.Now().Add(common.RWTimeout))
 	if err = conn.WriteMessage(websocket.TextMessage, login); err != nil {
 		conn.Close()

@@ -166,7 +166,6 @@ func (wsc *WSClient) GetClientState(clientAddr *net.UDPAddr) (*WSClientState, er
 				return nil, fmt.Errorf("Failed to connect websocket: %v", err)
 			}
 
-			common.SetPongHandler(conn)
 			conn.SetWriteDeadline(time.Now().Add(common.RWTimeout))
 			if err = conn.WriteMessage(websocket.TextMessage, login); err != nil {
 				conn.Close()
@@ -181,6 +180,7 @@ func (wsc *WSClient) GetClientState(clientAddr *net.UDPAddr) (*WSClientState, er
 				udpConnNum: wsc.udpConnNum,
 				wasActive:  true,
 			}
+			common.SetPongHandler(clientState.wsConn)
 
 			wsc.recvState[addrKey] = clientState
 			go wsc.RunClientConnection(clientState)
