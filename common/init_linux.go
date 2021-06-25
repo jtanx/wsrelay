@@ -5,6 +5,7 @@ import (
 	"log/syslog"
 	"os/exec"
 	"os/user"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -14,44 +15,24 @@ import (
 	logrus_syslog "github.com/sirupsen/logrus/hooks/syslog"
 )
 
-// GetLocalTime parses tz info in the posix time format, ignoring DST offsets
 func GetLocalTime() (*time.Location, error) {
-	cmd := exec.Command("nvram", "get", "tm_tz")
-	out, err := cmd.CombinedOutput()
+	if _, err := exec.LookPath("nvram"); err != nil || runtime.GOOS != "linux" || runtime.GOARCH != "arm" {
+		return time.Local, nil
+	}
+
+	cmd := exec.Command("date", "-R")
+	out, err := cmd.Output()
 	if err != nil {
 		return time.Local, err
 	}
 
-	rout := strings.TrimSpace(string(out))
-	for i, c := range rout {
-		if c == '-' || (c >= '0' && c <= '9') {
-			var j int
-			for j = i + 1; j < len(rout); j++ {
-				if rout[j] != '.' && !(rout[j] >= '0' && rout[j] <= '9') {
-					break
-				}
-			}
-
-			n, err := strconv.ParseFloat(rout[i:j], 64)
-			if err != nil {
-				return time.Local, err
-			}
-
-			name := rout[:i]
-			if name == "UTC" {
-				if rout[i] == '-' {
-					name = rout[:i] + "+" + rout[i+1:j]
-				} else {
-					name = rout[:i] + "-" + rout[i:j]
-				}
-			}
-
-			off := int(-n * 60 * 60)
-			return time.FixedZone(name, off), nil
-		}
+	tm, err := time.Parse(time.RFC1123Z, strings.TrimSpace(string(out)))
+	if err != nil {
+		return time.Local, err
 	}
 
-	return time.Local, fmt.Errorf("unable to parse %v", rout)
+	_, off := tm.Zone()
+	return time.FixedZone(tm.Format("UTC-07:00"), off), nil
 }
 
 func InitSyslog() {
