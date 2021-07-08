@@ -46,6 +46,7 @@ type WSReceiver struct {
 	destAddr *net.UDPAddr
 	srvAddr  string
 
+	hasFailed      bool
 	numActiveConns int
 	udpConnNum     int
 	wsConnNum      int
@@ -165,7 +166,11 @@ func (wsr *WSReceiver) ManageConnection(conn *wsConnPair) {
 }
 
 func (wsr *WSReceiver) AddConnection() error {
-	log.Infof("Connecting to %s", wsr.srvAddr)
+	level := log.InfoLevel
+	if wsr.hasFailed {
+		level = log.DebugLevel
+	}
+	log.StandardLogger().Logf(level, "Connecting to %s", wsr.srvAddr)
 
 	token, err := totp.GenerateCode(common.SrvKey, time.Now())
 	if err != nil {
@@ -210,8 +215,15 @@ func (wsr *WSReceiver) ManageConnections() {
 		wsr.cond.L.Unlock()
 
 		if err := wsr.AddConnection(); err != nil {
-			log.Warnf("Failed to add connection, sleeping for 15s: %v", err)
+			level := log.WarnLevel
+			if wsr.hasFailed {
+				level = log.DebugLevel
+			}
+			wsr.hasFailed = true
+			log.StandardLogger().Logf(level, "Failed to add connection, sleeping for 15s: %v", err)
 			time.Sleep(15 * time.Second)
+		} else {
+			wsr.hasFailed = false
 		}
 	}
 }
