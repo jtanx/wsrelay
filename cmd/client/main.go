@@ -16,58 +16,45 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-type UDPAddrKey struct {
-	IP   string
-	Port int
-}
-
-func NewUDPAddrKey(addr *net.UDPAddr) UDPAddrKey {
-	return UDPAddrKey{
-		IP:   string(addr.IP),
-		Port: addr.Port,
-	}
-}
-
 type WSClientState struct {
-	addr       *net.UDPAddr
+	tcpConn    net.Conn
 	wsConn     *common.WebsocketConn
-	udpConnNum int
-	wasActive  bool
+	tcpConnNum int
 }
 
 func (wcs WSClientState) String() string {
-	return fmt.Sprintf("%s <-> [udp-%d] [%s]",
-		wcs.wsConn.String(), wcs.udpConnNum, wcs.addr.String())
+	return fmt.Sprintf("%s <-> [tcp-%d] [%s]",
+		wcs.wsConn.String(), wcs.tcpConnNum, wcs.tcpConn.RemoteAddr().String())
 }
 
 type WSClient struct {
-	recvAddr *net.UDPAddr
+	recvAddr *net.TCPAddr
 	destAddr string
 
-	recvConn   *net.UDPConn
-	recvState  map[UDPAddrKey]*WSClientState
-	udpConnNum int
-	wsConnNum  int
+	recvListener *net.TCPListener
+	recvState    map[net.Conn]*WSClientState
+	tcpConnNum   int
+	wsConnNum    int
 
 	mu sync.RWMutex
 }
 
 func NewWSClient(recvAddr, destAddr string) (*WSClient, error) {
-	uRecvAddr, err := net.ResolveUDPAddr("udp", recvAddr)
+	uRecvAddr, err := net.ResolveTCPAddr("tcp", recvAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := net.ListenUDP("udp", uRecvAddr)
+	listener, err := net.ListenTCP("tcp", uRecvAddr)
 	if err != nil {
 		return nil, err
 	}
 
 	return &WSClient{
-		recvAddr:  uRecvAddr,
-		destAddr:  destAddr,
-		recvConn:  conn,
-		recvState: map[UDPAddrKey]*WSClientState{},
+		recvAddr:     uRecvAddr,
+		destAddr:     destAddr,
+		recvListener: listener,
+		recvState:    map[net.Conn]*WSClientState{},
 	}, nil
 }
 
@@ -92,20 +79,15 @@ func (wsc *WSClient) GetConnections() []*common.WebsocketConn {
 	defer wsc.mu.RUnlock()
 	conns := make([]*common.WebsocketConn, 0, len(wsc.recvState))
 	for _, v := range wsc.recvState {
-		if v.wasActive {
-			conns = append(conns, v.wsConn)
-			v.wasActive = false // not locked around this...
-		} else {
-			log.Infof("Excluding %s from active conns", v.String())
-		}
+		conns = append(conns, v.wsConn)
 	}
 	return conns
 }
 
-func (wsc *WSClient) RunClientConnection(clientState *WSClientState) {
+func (wsc *WSClient) ReadFromWS(clientState *WSClientState) {
 	defer wsc.RemoveConnection(clientState.wsConn)
 
-	log.Infof("Managing connection %s", clientState.String())
+	log.Infof("Reading from WS->TCP %s", clientState.String())
 	var buf [common.MaxMessageSize]byte
 	for {
 		mt, rdr, err := clientState.wsConn.Conn.NextReader()
@@ -117,118 +99,102 @@ func (wsc *WSClient) RunClientConnection(clientState *WSClientState) {
 			break
 		}
 
-		var n int
-		for err == nil {
-			n, err = rdr.Read(buf[0:])
-			if err == nil {
-				_, err = wsc.recvConn.WriteToUDP(buf[:n], clientState.addr)
-			}
-		}
-		if err != nil && err != io.EOF {
-			log.Warnf("Error reading from WS to UDP: %v: %v", clientState, err)
+		if _, err := io.CopyBuffer(clientState.tcpConn, rdr, buf[0:]); err != nil {
+			log.Warnf("Error reading from WS to TCP: %v: %v", clientState, err)
 			break
 		}
 	}
 }
 
-func (wsc *WSClient) GetClientState(clientAddr *net.UDPAddr) (*WSClientState, error) {
-	addrKey := NewUDPAddrKey(clientAddr)
+func (wsc *WSClient) WriteToWS(clientState *WSClientState) {
+	defer wsc.RemoveConnection(clientState.wsConn)
 
-	wsc.mu.RLock()
-	clientState := wsc.recvState[addrKey]
-	wsc.mu.RUnlock()
+	log.Infof("Writing from TCP->WS %s", clientState.String())
+	var buf [common.MaxMessageSize]byte
+	for {
+		n, err := clientState.tcpConn.Read(buf[0:])
+		if err != nil {
+			log.Warnf("Failed to read from %v: %s", clientState.String(), err)
+			break
+		}
 
-	if clientState == nil {
-		return func() (*WSClientState, error) {
-			wsc.mu.Lock()
-			defer wsc.mu.Unlock()
+		wc, err := clientState.wsConn.Conn.NextWriter(websocket.BinaryMessage)
+		if err != nil {
+			log.Warnf("Failed to create writer for %v: %v", clientState.String(), err)
+			break
+		} else if _, err = wc.Write(buf[:n]); err != nil {
+			log.Warnf("Failed to write to %v: %v", clientState.String(), err)
+			wc.Close()
+			break
+		} else if err = wc.Close(); err != nil {
+			log.Warnf("Failed to close writer for %v: %v", clientState.String(), err)
+		}
+	}
+}
 
-			clientState := wsc.recvState[addrKey]
-			if clientState != nil {
-				return clientState, nil
-			}
-
-			log.Infof("Accepting new connection from %v to %v", clientAddr, wsc.destAddr)
-			token, err := totp.GenerateCode(common.CliKey, time.Now())
-			if err != nil {
-				return nil, fmt.Errorf("Failed to generate TOTP token: %v", err)
-			}
-			login, err := json.Marshal(common.LoginMessage{
-				AsReceiver: false,
-				Token:      token,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("Failed to serialise login message: %v", err)
-			}
-
-			conn, _, err := websocket.DefaultDialer.Dial(wsc.destAddr, http.Header{})
-			if err != nil {
-				return nil, fmt.Errorf("Failed to connect websocket: %v", err)
-			}
-
-			conn.SetWriteDeadline(time.Now().Add(common.RWTimeout))
-			if err = conn.WriteMessage(websocket.TextMessage, login); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("Failed to send login: %v", err)
-			}
-
-			wsc.wsConnNum++
-			wsc.udpConnNum++
-			clientState = &WSClientState{
-				addr:       clientAddr,
-				wsConn:     common.NewWebsocketConn(conn, "[ws-%d]", wsc.wsConnNum),
-				udpConnNum: wsc.udpConnNum,
-				wasActive:  true,
-			}
-			common.SetPongHandler(clientState.wsConn)
-
-			wsc.recvState[addrKey] = clientState
-			go wsc.RunClientConnection(clientState)
-
-			return clientState, nil
-		}()
+func (wsc *WSClient) ManageConn(clConn net.Conn) error {
+	log.Infof("Accepting new connection from %v to %v", clConn.RemoteAddr(), wsc.destAddr)
+	token, err := totp.GenerateCode(common.CliKey, time.Now())
+	if err != nil {
+		return fmt.Errorf("Failed to generate TOTP token: %v", err)
+	}
+	login, err := json.Marshal(common.LoginMessage{
+		AsReceiver: false,
+		Token:      token,
+	})
+	if err != nil {
+		return fmt.Errorf("Failed to serialise login message: %v", err)
 	}
 
-	return clientState, nil
+	conn, _, err := websocket.DefaultDialer.Dial(wsc.destAddr, http.Header{})
+	if err != nil {
+		return fmt.Errorf("Failed to connect websocket: %v", err)
+	}
+
+	conn.SetWriteDeadline(time.Now().Add(common.RWTimeout))
+	if err = conn.WriteMessage(websocket.TextMessage, login); err != nil {
+		conn.Close()
+		return fmt.Errorf("Failed to send login: %v", err)
+	}
+
+	wsc.wsConnNum++
+	wsc.tcpConnNum++
+
+	wsc.mu.Lock()
+	if wsc.recvState[clConn] != nil {
+		return fmt.Errorf("SHOULD NOT HAPPEN: RECV STATE WAS NOT NIL: %v, %v", clConn, wsc.recvState[clConn])
+	}
+
+	clientState := &WSClientState{
+		tcpConn:    clConn,
+		wsConn:     common.NewWebsocketConn(conn, "[ws-%d]", wsc.wsConnNum),
+		tcpConnNum: wsc.tcpConnNum,
+	}
+	wsc.recvState[clConn] = clientState
+	wsc.mu.Unlock()
+
+	common.SetPongHandler(clientState.wsConn)
+
+	go wsc.ReadFromWS(clientState)
+	go wsc.WriteToWS(clientState)
+	return nil
 }
 
 func (wsc *WSClient) Listen() {
 	log.Infof("Listening on %v", wsc.recvAddr)
-	buf := make([]byte, common.MaxMessageSize)
 	for {
-		n, clAddr, err := wsc.recvConn.ReadFromUDP(buf)
+		conn, err := wsc.recvListener.Accept()
 		if err != nil {
-			log.Warnf("Error reading from UDP listening port: %v", err)
+			log.Warnf("Error accepting TCP conn: %v", err)
 			continue
 		}
 
-		if clAddr.Port == wsc.recvAddr.Port && clAddr.IP.Equal(wsc.recvAddr.IP) {
-			log.Errorf("Received data on our bound port: %v", clAddr)
-			return
-		}
-
-		clientState, err := wsc.GetClientState(clAddr)
-		if err != nil {
-			log.Warnf("Error fetching client state: %v", err)
-			continue
-		}
-
-		log.Debugf("Recv bytes srv %v %v", clAddr, n)
-		clientState.wasActive = true
-		wc, err := clientState.wsConn.Conn.NextWriter(websocket.BinaryMessage)
-		if err != nil {
-			log.Warnf("Failed to make WS writer: %v: %v", clientState, err)
-			wsc.RemoveConnection(clientState.wsConn)
-			continue
-		}
-
-		_, err = wc.Write(buf[:n])
-		wc.Close()
-		if err != nil {
-			log.Warnf("Failed to write to WS: %v: %v", clientState, err)
-			wsc.RemoveConnection(clientState.wsConn)
-			continue
-		}
+		go func() {
+			err := wsc.ManageConn(conn)
+			if err != nil {
+				log.Warnf("Failed to manage conn: %v", err)
+			}
+		}()
 	}
 }
 

@@ -21,7 +21,7 @@ const maxConns = 10
 
 type wsConnPair struct {
 	wsConn        *common.WebsocketConn
-	clientConn    *net.UDPConn
+	clientConn    *net.TCPConn
 	clientConnNum int
 }
 
@@ -29,7 +29,7 @@ func (wcp wsConnPair) String() string {
 	if wcp.clientConn == nil {
 		return fmt.Sprintf("%s (unpaired)", wcp.wsConn.String())
 	}
-	return fmt.Sprintf("%s <-> [udp-%d] [%s->%s]",
+	return fmt.Sprintf("%s <-> [tcp-%d] [%s->%s]",
 		wcp.wsConn.String(), wcp.clientConnNum,
 		wcp.clientConn.LocalAddr().String(), wcp.clientConn.RemoteAddr().String())
 }
@@ -43,12 +43,12 @@ func NewWSConnPair(wsConn *websocket.Conn, wsDesc string, wsDescArgs ...interfac
 }
 
 type WSReceiver struct {
-	destAddr *net.UDPAddr
+	destAddr *net.TCPAddr
 	srvAddr  string
 
 	hasFailed      bool
 	numActiveConns int
-	udpConnNum     int
+	tcpConnNum     int
 	wsConnNum      int
 	conns          []*wsConnPair
 	mu             sync.Mutex
@@ -56,7 +56,7 @@ type WSReceiver struct {
 }
 
 func NewWSReceiver(destAddr, srvAddr string) (*WSReceiver, error) {
-	uDestAddr, err := net.ResolveUDPAddr("udp", destAddr)
+	uDestAddr, err := net.ResolveTCPAddr("tcp", destAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +115,7 @@ func (wsr *WSReceiver) ManageConnection(conn *wsConnPair) {
 		}
 
 		if conn.clientConn == nil {
-			conn.clientConn, err = net.DialUDP("udp", nil, wsr.destAddr)
+			conn.clientConn, err = net.DialTCP("tcp", nil, wsr.destAddr)
 			if err != nil {
 				log.Warnf("Could not open destination connection: %v", err)
 				break
@@ -123,8 +123,8 @@ func (wsr *WSReceiver) ManageConnection(conn *wsConnPair) {
 
 			wsr.mu.Lock()
 			wsr.numActiveConns++
-			wsr.udpConnNum++
-			conn.clientConnNum = wsr.udpConnNum
+			wsr.tcpConnNum++
+			conn.clientConnNum = wsr.tcpConnNum
 			wsr.mu.Unlock()
 			wsr.cond.Broadcast()
 
@@ -137,7 +137,7 @@ func (wsr *WSReceiver) ManageConnection(conn *wsConnPair) {
 				for {
 					n, err := conn.clientConn.Read(rdBuf[0:])
 					if err != nil {
-						log.Warnf("Failed to read from UDP conn: %v: %v", conn, err)
+						log.Warnf("Failed to read from TCP conn: %v: %v", conn, err)
 						break
 					}
 
