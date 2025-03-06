@@ -1,0 +1,3 @@
+[submodule "c/thirdparty/libuwsc"]
+	path = c/thirdparty/libuwsc
+	url = https://github.com/zhaojh329/libuwsc
