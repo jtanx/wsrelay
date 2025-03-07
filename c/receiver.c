@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
+#include <netinet/tcp.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,7 +29,10 @@ typedef struct ws_client
 	struct uwsc_client ws_client;
 
 	int paired_fd;
-	struct ev_io paired_fd_watcher;
+	bool paired_fd_connected;
+	struct ev_io paired_fd_read;
+	struct ev_io paired_fd_write;
+	struct buffer fd_writebuf;
 } ws_client;
 
 struct ws_state
@@ -65,6 +69,24 @@ static void schedule_cleanup(ws_client* wsc)
 	}
 }
 
+static bool check_conn(ws_client* wsc)
+{
+	if (!wsc->paired_fd_connected && !wsc->cleanup)
+	{
+		int err;
+		socklen_t optlen = sizeof(err);
+		if (getsockopt(wsc->paired_fd, SOL_SOCKET, SO_ERROR, &err, &optlen) == -1 || err)
+		{
+			log_err("[con-%d] connection failure fd=%d: %s\n",
+				wsc->id, wsc->paired_fd, strerror(err));
+			schedule_cleanup(wsc);
+			return false;
+		}
+		wsc->paired_fd_connected = true;
+	}
+	return !wsc->cleanup;
+}
+
 static void ws_onopen(struct uwsc_client* cl)
 {
 	ws_client* wsc = (ws_client*)cl->ext;
@@ -81,23 +103,58 @@ static void srv_read(struct ev_loop* loop, struct ev_io* w, int revents)
 {
 	ws_client* wsc = (ws_client*)w->data;
 
+	if (!check_conn(wsc))
+	{
+		return;
+	}
+
 	char buf[8192];
 	int nr = recv(wsc->paired_fd, buf, sizeof(buf) - 1, 0);
-	log_info("[con-%d] read %d bytes\n", wsc->id, nr);
-
-	if (nr <= 0 || wsc->cleanup || wsc->paired_fd <= 0)
+	if (nr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
 	{
+		return;
+	}
+	else if (nr <= 0)
+	{
+		log(nr < 0 ? LOG_ERR : LOG_INFO,
+			"[con-%d] socket read interrupted, rc=%d, errno=%d, err=%s\n",
+			wsc->id, nr, errno, strerror(errno));
 		schedule_cleanup(wsc);
 		return;
 	}
+
+	log_info("[con-%d] read %d bytes\n", wsc->id, nr);
 	wsc->ws_client.send(&wsc->ws_client, buf, nr, UWSC_OP_BINARY);
+}
+
+static void srv_write(struct ev_loop* loop, struct ev_io* w, int revents)
+{
+	ws_client* wsc = (ws_client*)w->data;
+
+	if (!check_conn(wsc))
+	{
+		return;
+	}
+
+	log_debug("[con-%d] send %zu bytes to %d\n", wsc->id, buffer_length(&wsc->fd_writebuf), wsc->paired_fd);
+	if (buffer_pull_to_fd(&wsc->fd_writebuf, wsc->paired_fd, buffer_length(&wsc->fd_writebuf)) < 0)
+	{
+		log_err("[con-%d] failed to send to fd=%d: %s\n",
+			wsc->id, wsc->paired_fd, strerror(errno));
+		schedule_cleanup(wsc);
+	}
+
+	if (buffer_length(&wsc->fd_writebuf) < 1)
+	{
+		ev_io_stop(wsc->state->loop, w);
+	}
 }
 
 static void ws_onmessage(struct uwsc_client* cl, void* data, size_t len,
 	bool binary)
 {
 	ws_client* wsc = (ws_client*)cl->ext;
-	log_info("[con-%d] ws message %zu bytes, binary=%d\n", wsc->id, len, binary);
+	log_debug("[con-%d] ws message %zu bytes, binary=%d\n", wsc->id, len, binary);
 
 	if (wsc->cleanup || !binary)
 	{
@@ -108,9 +165,14 @@ static void ws_onmessage(struct uwsc_client* cl, void* data, size_t len,
 
 	if (wsc->paired_fd == -1)
 	{
-		wsc->paired_fd = socket(AF_INET, SOCK_STREAM, 0);
+		wsc->paired_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+
+		int flag = 1;
+		setsockopt(wsc->paired_fd, IPPROTO_TCP, TCP_NODELAY, (void*)&flag, sizeof(flag));
+
 		if (connect(wsc->paired_fd, (struct sockaddr*)&wsc->state->server_addr,
-				sizeof(wsc->state->server_addr)) == -1)
+				sizeof(wsc->state->server_addr)) == -1 &&
+			errno != EINPROGRESS)
 		{
 			const char* err = strerror(errno);
 			log_err("[con-%d] connect failed: fd=%d, addr=%s:%d: %s\n",
@@ -120,16 +182,13 @@ static void ws_onmessage(struct uwsc_client* cl, void* data, size_t len,
 			return;
 		}
 
-		ev_io_init(&wsc->paired_fd_watcher, srv_read, wsc->paired_fd, EV_READ);
-		ev_io_start(wsc->state->loop, &wsc->paired_fd_watcher);
+		ev_io_init(&wsc->paired_fd_read, srv_read, wsc->paired_fd, EV_READ);
+		ev_io_init(&wsc->paired_fd_write, srv_write, wsc->paired_fd, EV_WRITE);
+		ev_io_start(wsc->state->loop, &wsc->paired_fd_read);
 	}
 
-	if (send(wsc->paired_fd, data, len, 0) == -1)
-	{
-		log_err("[con-%d] failed to send to fd=%d: %s\n",
-			wsc->id, wsc->paired_fd, strerror(errno));
-		schedule_cleanup(wsc);
-	}
+	buffer_put_data(&wsc->fd_writebuf, data, len);
+	ev_io_start(wsc->state->loop, &wsc->paired_fd_write);
 }
 
 static void ws_onerror(struct uwsc_client* cl, int err, const char* msg)
@@ -162,7 +221,8 @@ static void init_client(ws_state* state, ws_client* wsc, int id)
 	wsc->state = state;
 	wsc->id = id;
 	wsc->paired_fd = -1;
-	wsc->paired_fd_watcher.data = wsc;
+	wsc->paired_fd_read.data = wsc;
+	wsc->paired_fd_write.data = wsc;
 
 	if (uwsc_init(&wsc->ws_client, state->loop, state->ws_url,
 			state->ping_interval, NULL) < 0)
@@ -208,10 +268,15 @@ static void cleanup_cb(struct ev_loop* loop, struct ev_prepare* w, int revents)
 		ws_client* wsc = &state->clients[i];
 		if (wsc->cleanup)
 		{
-			if (ev_is_active(&wsc->paired_fd_watcher))
+			if (ev_is_active(&wsc->paired_fd_read))
 			{
-				log_info("[con-%d] closing paired fd watcher\n", wsc->id);
-				ev_io_stop(state->loop, &wsc->paired_fd_watcher);
+				log_info("[con-%d] closing paired fd read\n", wsc->id);
+				ev_io_stop(state->loop, &wsc->paired_fd_read);
+			}
+			if (ev_is_active(&wsc->paired_fd_write))
+			{
+				log_info("[con-%d] closing paired fd write\n", wsc->id);
+				ev_io_stop(state->loop, &wsc->paired_fd_write);
 			}
 			if (wsc->paired_fd > 0)
 			{
@@ -226,6 +291,7 @@ static void cleanup_cb(struct ev_loop* loop, struct ev_prepare* w, int revents)
 			}
 
 			log_info("[con-%d] finished cleanup\n", wsc->id);
+			buffer_free(&wsc->fd_writebuf);
 			memset(wsc, 0, sizeof(ws_client));
 		}
 	}
