@@ -34,13 +34,14 @@ typedef struct ws_client
 struct ws_state
 {
 	struct ev_loop* loop;
-	struct ev_idle cleanup_watcher;
+	struct ev_prepare cleanup_watcher;
 	struct ev_signal signal_watcher;
 	struct ev_timer init_watcher;
 
 	const char* ws_url;
 	int ping_interval;
 
+	const char* server_ip;
 	struct sockaddr_in server_addr;
 
 	ws_client clients[MAX_CONNS];
@@ -60,7 +61,7 @@ static void schedule_cleanup(ws_client* wsc)
 	if (!ev_is_active(&wsc->state->cleanup_watcher))
 	{
 		log_info("[con-%d] scheduling cleanup callback\n", wsc->id);
-		ev_idle_start(wsc->state->loop, &wsc->state->cleanup_watcher);
+		ev_prepare_start(wsc->state->loop, &wsc->state->cleanup_watcher);
 	}
 }
 
@@ -79,21 +80,17 @@ static void ws_onopen(struct uwsc_client* cl)
 static void srv_read(struct ev_loop* loop, struct ev_io* w, int revents)
 {
 	ws_client* wsc = (ws_client*)w->data;
-	if (wsc->cleanup || wsc->paired_fd <= 0)
-	{
-		log_warn("[con-%d] discarding unpaired fd read fd=%d\n", wsc->id, wsc->paired_fd);
-		schedule_cleanup(wsc);
-		return;
-	}
 
 	char buf[8192];
 	int nr = recv(wsc->paired_fd, buf, sizeof(buf) - 1, 0);
 	log_info("[con-%d] read %d bytes\n", wsc->id, nr);
 
-	if (nr > 0)
+	if (nr <= 0 || wsc->cleanup || wsc->paired_fd <= 0)
 	{
-		wsc->ws_client.send(&wsc->ws_client, buf, nr, UWSC_OP_BINARY);
+		schedule_cleanup(wsc);
+		return;
 	}
+	wsc->ws_client.send(&wsc->ws_client, buf, nr, UWSC_OP_BINARY);
 }
 
 static void ws_onmessage(struct uwsc_client* cl, void* data, size_t len,
@@ -115,7 +112,10 @@ static void ws_onmessage(struct uwsc_client* cl, void* data, size_t len,
 		if (connect(wsc->paired_fd, (struct sockaddr*)&wsc->state->server_addr,
 				sizeof(wsc->state->server_addr)) == -1)
 		{
-			log_err("[con-%d] connect failed: %s\n", wsc->id, strerror(errno));
+			const char* err = strerror(errno);
+			log_err("[con-%d] connect failed: fd=%d, addr=%s:%d: %s\n",
+				wsc->id, wsc->paired_fd, wsc->state->server_ip,
+				ntohs(wsc->state->server_addr.sin_port), err);
 			schedule_cleanup(wsc);
 			return;
 		}
@@ -194,14 +194,14 @@ static void init_cb(struct ev_loop* loop, struct ev_timer* t, int revents)
 	}
 }
 
-static void cleanup_cb(struct ev_loop* loop, struct ev_idle* w, int revents)
+static void cleanup_cb(struct ev_loop* loop, struct ev_prepare* w, int revents)
 {
 	log_info("Cleanup running\n");
 
 	ws_state* state = (ws_state*)w->data;
 	assert(state->loop == loop);
 	assert(&state->cleanup_watcher == w);
-	ev_idle_stop(state->loop, &state->cleanup_watcher);
+	ev_prepare_stop(state->loop, &state->cleanup_watcher);
 
 	for (int i = 0; i < MAX_CONNS; ++i)
 	{
@@ -273,18 +273,19 @@ int main(int argc, char* argv[])
 	}
 
 	state.ws_url = argv[1];
-	state.server_addr.sin_port = atoi(argv[3]);
+	state.server_ip = argv[2];
+	state.server_addr.sin_port = htons(atoi(argv[3]));
 
-	if (inet_pton(AF_INET, argv[2], &state.server_addr.sin_addr) <= 0)
+	if (inet_pton(AF_INET, state.server_ip, &state.server_addr.sin_addr) != 1)
 	{
 		const char* err = strerror(errno);
-		log_err("Invalid server address: %s: %s\n", argv[2], err);
+		log_err("Invalid server address: %s: %s\n", state.server_ip, err);
 		return 1;
 	}
 
-	log_info("WS relay: %s <-> %s:%d\n", state.ws_url, argv[2], state.server_addr.sin_port);
+	log_info("WS relay: %s <-> %s:%d\n", state.ws_url, state.server_ip, ntohs(state.server_addr.sin_port));
 
-	ev_idle_init(&state.cleanup_watcher, cleanup_cb);
+	ev_prepare_init(&state.cleanup_watcher, cleanup_cb);
 	ev_signal_init(&state.signal_watcher, signal_cb, SIGINT);
 	ev_timer_init(&state.init_watcher, init_cb, RECONNECT_INTERVAL_SECS, 0.0);
 	ev_signal_start(state.loop, &state.signal_watcher);
