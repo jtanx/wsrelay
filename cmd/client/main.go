@@ -64,6 +64,8 @@ func (wsc *WSClient) RemoveConnection(conn *common.WebsocketConn) {
 	for k, v := range wsc.recvState {
 		if v.wsConn == conn {
 			delete(wsc.recvState, k)
+
+			v.tcpConn.Close()
 			conn.Conn.Close()
 
 			log.Infof("Removed conn %s, num conns %v",
