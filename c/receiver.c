@@ -9,10 +9,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <uwsc/uwsc.h>
+#include <uwsc.h>
 
-#define MAX_CONNS 2
-#define RECONNECT_INTERVAL_SECS 15
+#define MAX_CONNS 3
+#define RECONNECT_INTERVAL_SECS 2
 
 typedef struct ws_state ws_state;
 
@@ -123,7 +123,7 @@ static void srv_read(struct ev_loop* loop, struct ev_io* w, int revents)
 		return;
 	}
 
-	log_info("[con-%d] read %d bytes\n", wsc->id, nr);
+	log_debug("[con-%d] read %d bytes\n", wsc->id, nr);
 	wsc->ws_client.send(&wsc->ws_client, buf, nr, UWSC_OP_BINARY);
 }
 
@@ -329,15 +329,16 @@ int main(int argc, char* argv[])
 	state.ping_interval = 10;
 	state.server_addr.sin_family = AF_INET;
 
-	uwsc_load_ca_crt_file("DigiCertGlobalRootG2.crt");
 	log_level(LOG_INFO);
-
-	if (argc != 4)
+	
+	if (argc != 5)
 	{
-		fprintf(stderr, "Usage: %s ws://path-to/relay 127.0.0.1 1234\n", argv[0]);
+		fprintf(stderr, "Usage: %s ws://path-to/relay 127.0.0.1 1234 ssl.crt\n", argv[0]);
 		return 1;
 	}
 
+	uwsc_load_ca_crt_file(argv[4]);
+	
 	state.ws_url = argv[1];
 	state.server_ip = argv[2];
 	state.server_addr.sin_port = htons(atoi(argv[3]));
