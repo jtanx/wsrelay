@@ -39,6 +39,7 @@ struct ws_state
 {
 	struct ev_loop* loop;
 	struct ev_prepare cleanup_watcher;
+	struct ev_idle blocked_watcher;
 	struct ev_signal signal_watcher;
 	struct ev_timer init_watcher;
 
@@ -108,7 +109,7 @@ static void srv_read(struct ev_loop* loop, struct ev_io* w, int revents)
 		return;
 	}
 
-	char buf[8192];
+	char buf[4096];
 	int nr = recv(wsc->paired_fd, buf, sizeof(buf) - 1, 0);
 	if (nr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
 	{
@@ -125,6 +126,14 @@ static void srv_read(struct ev_loop* loop, struct ev_io* w, int revents)
 
 	log_debug("[con-%d] read %d bytes\n", wsc->id, nr);
 	wsc->ws_client.send(&wsc->ws_client, buf, nr, UWSC_OP_BINARY);
+	if (buffer_length(&wsc->ws_client.wb) > 32768)
+	{
+		log_debug("[con-%d] blocking ws write bufsiz=%zu\n",
+			wsc->id, buffer_length(&wsc->ws_client.wb));
+		ev_io_stop(wsc->state->loop, &wsc->paired_fd_read);
+
+		ev_idle_start(wsc->state->loop, &wsc->state->blocked_watcher);
+	}
 }
 
 static void srv_write(struct ev_loop* loop, struct ev_io* w, int revents)
@@ -182,6 +191,7 @@ static void ws_onmessage(struct uwsc_client* cl, void* data, size_t len,
 			return;
 		}
 
+		log_info("[con-%d] paired with fd=%d\n", wsc->id, wsc->paired_fd);
 		ev_io_init(&wsc->paired_fd_read, srv_read, wsc->paired_fd, EV_READ);
 		ev_io_init(&wsc->paired_fd_write, srv_write, wsc->paired_fd, EV_WRITE);
 		ev_io_start(wsc->state->loop, &wsc->paired_fd_read);
@@ -189,6 +199,14 @@ static void ws_onmessage(struct uwsc_client* cl, void* data, size_t len,
 
 	buffer_put_data(&wsc->fd_writebuf, data, len);
 	ev_io_start(wsc->state->loop, &wsc->paired_fd_write);
+	if (buffer_length(&wsc->fd_writebuf) > 32768)
+	{
+		log_debug("[con-%d] blocking ws read - socket write bufsiz=%zu\n",
+			wsc->id, buffer_length(&wsc->fd_writebuf));
+		ev_io_stop(wsc->state->loop, &wsc->ws_client.ior);
+
+		ev_idle_start(wsc->state->loop, &wsc->state->blocked_watcher);
+	}
 }
 
 static void ws_onerror(struct uwsc_client* cl, int err, const char* msg)
@@ -268,6 +286,8 @@ static void cleanup_cb(struct ev_loop* loop, struct ev_prepare* w, int revents)
 		ws_client* wsc = &state->clients[i];
 		if (wsc->cleanup)
 		{
+			log_info("[con-%d] bufsiz on cleanup sock_w=%zu\n",
+				wsc->id, buffer_length(&wsc->fd_writebuf));
 			if (ev_is_active(&wsc->paired_fd_read))
 			{
 				log_info("[con-%d] closing paired fd read\n", wsc->id);
@@ -304,7 +324,55 @@ static void cleanup_cb(struct ev_loop* loop, struct ev_prepare* w, int revents)
 	}
 	else
 	{
-		log_debug("Re-init timer already scheduled");
+		log_debug("Re-init timer already scheduled\n");
+	}
+}
+
+static void blocked_cb(struct ev_loop* loop, struct ev_idle* w, int revents)
+{
+	ws_state* state = (ws_state*)w->data;
+	assert(state->loop == loop);
+	assert(&state->blocked_watcher == w);
+
+	bool any_remain = false;
+	for (int i = 0; i < MAX_CONNS; ++i)
+	{
+		ws_client* wsc = &state->clients[i];
+		if (!wsc->cleanup && wsc->ws_initialised)
+		{
+			if (!ev_is_active(&wsc->paired_fd_read))
+			{
+				if (buffer_length(&wsc->ws_client.wb) > 16384)
+				{
+					any_remain = true;
+				}
+				else
+				{
+					log_debug("[con-%d] unblocking socket read ws writelen=%zu\n",
+						wsc->id, buffer_length(&wsc->ws_client.wb));
+					ev_io_start(state->loop, &wsc->paired_fd_read);
+				}
+			}
+			if (!ev_is_active(&wsc->ws_client.ior))
+			{
+				if (buffer_length(&wsc->fd_writebuf) > 16384)
+				{
+					any_remain = true;
+				}
+				else
+				{
+					log_debug("[con-%d] unblocking ws read ws writelen=%zu\n",
+						wsc->id, buffer_length(&wsc->fd_writebuf));
+					ev_io_start(state->loop, &wsc->ws_client.ior);
+				}
+			}
+		}
+	}
+
+	if (!any_remain)
+	{
+		log_debug("Stopping blocked callback\n");
+		ev_idle_stop(state->loop, &state->blocked_watcher);
 	}
 }
 
@@ -325,12 +393,13 @@ int main(int argc, char* argv[])
 	state.loop = EV_DEFAULT;
 	state.signal_watcher.data = &state;
 	state.cleanup_watcher.data = &state;
+	state.blocked_watcher.data = &state;
 	state.init_watcher.data = &state;
 	state.ping_interval = 10;
 	state.server_addr.sin_family = AF_INET;
 
 	log_level(LOG_INFO);
-	
+
 	if (argc != 5)
 	{
 		fprintf(stderr, "Usage: %s ws://path-to/relay 127.0.0.1 1234 ssl.crt\n", argv[0]);
@@ -338,7 +407,7 @@ int main(int argc, char* argv[])
 	}
 
 	uwsc_load_ca_crt_file(argv[4]);
-	
+
 	state.ws_url = argv[1];
 	state.server_ip = argv[2];
 	state.server_addr.sin_port = htons(atoi(argv[3]));
@@ -352,6 +421,7 @@ int main(int argc, char* argv[])
 
 	log_info("WS relay: %s <-> %s:%d\n", state.ws_url, state.server_ip, ntohs(state.server_addr.sin_port));
 
+	ev_idle_init(&state.blocked_watcher, blocked_cb);
 	ev_prepare_init(&state.cleanup_watcher, cleanup_cb);
 	ev_signal_init(&state.signal_watcher, signal_cb, SIGINT);
 	ev_timer_init(&state.init_watcher, init_cb, RECONNECT_INTERVAL_SECS, 0.0);
