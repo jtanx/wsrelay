@@ -4,7 +4,9 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
+#include <grp.h>
 #include <netinet/tcp.h>
+#include <pwd.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +41,6 @@ struct ws_state
 {
 	struct ev_loop* loop;
 	struct ev_prepare cleanup_watcher;
-	struct ev_idle blocked_watcher;
 	struct ev_signal signal_watcher;
 	struct ev_timer init_watcher;
 
@@ -131,8 +132,6 @@ static void srv_read(struct ev_loop* loop, struct ev_io* w, int revents)
 		log_debug("[con-%d] blocking ws write bufsiz=%zu\n",
 			wsc->id, buffer_length(&wsc->ws_client.wb));
 		ev_io_stop(wsc->state->loop, &wsc->paired_fd_read);
-
-		ev_idle_start(wsc->state->loop, &wsc->state->blocked_watcher);
 	}
 }
 
@@ -151,6 +150,12 @@ static void srv_write(struct ev_loop* loop, struct ev_io* w, int revents)
 		log_err("[con-%d] failed to send to fd=%d: %s\n",
 			wsc->id, wsc->paired_fd, strerror(errno));
 		schedule_cleanup(wsc);
+	}
+	else if (!ev_is_active(&wsc->ws_client.ior) && buffer_length(&wsc->fd_writebuf) <= 16384)
+	{
+		log_debug("[con-%d] unblocking ws read ws writelen=%zu\n",
+			wsc->id, buffer_length(&wsc->fd_writebuf));
+		ev_io_start(wsc->state->loop, &wsc->ws_client.ior);
 	}
 
 	if (buffer_length(&wsc->fd_writebuf) < 1)
@@ -204,8 +209,6 @@ static void ws_onmessage(struct uwsc_client* cl, void* data, size_t len,
 		log_debug("[con-%d] blocking ws read - socket write bufsiz=%zu\n",
 			wsc->id, buffer_length(&wsc->fd_writebuf));
 		ev_io_stop(wsc->state->loop, &wsc->ws_client.ior);
-
-		ev_idle_start(wsc->state->loop, &wsc->state->blocked_watcher);
 	}
 }
 
@@ -225,6 +228,17 @@ static void ws_onclose(struct uwsc_client* cl, int code, const char* reason)
 	log_info("[con-%d] close: %d %s\n", wsc->id, code, reason);
 	wsc->ws_initialised = false; // libuwsc frees
 	schedule_cleanup(wsc);
+}
+
+static void ws_onwrite(struct uwsc_client* cl)
+{
+	ws_client* wsc = (ws_client*)cl->ext;
+	if (wsc->paired_fd_connected && !wsc->cleanup && !ev_is_active(&wsc->paired_fd_read))
+	{
+		log_debug("[con-%d] unblocking socket read ws writelen=%zu\n",
+			wsc->id, buffer_length(&wsc->ws_client.wb));
+		ev_io_start(wsc->state->loop, &wsc->paired_fd_read);
+	}
 }
 
 static void init_client(ws_state* state, ws_client* wsc, int id)
@@ -254,6 +268,8 @@ static void init_client(ws_state* state, ws_client* wsc, int id)
 	wsc->ws_client.onmessage = ws_onmessage;
 	wsc->ws_client.onerror = ws_onerror;
 	wsc->ws_client.onclose = ws_onclose;
+	wsc->ws_client.onwrite = ws_onwrite;
+	wsc->ws_client.wb_limit = 16384;
 	wsc->ws_initialised = true;
 }
 
@@ -328,54 +344,6 @@ static void cleanup_cb(struct ev_loop* loop, struct ev_prepare* w, int revents)
 	}
 }
 
-static void blocked_cb(struct ev_loop* loop, struct ev_idle* w, int revents)
-{
-	ws_state* state = (ws_state*)w->data;
-	assert(state->loop == loop);
-	assert(&state->blocked_watcher == w);
-
-	bool any_remain = false;
-	for (int i = 0; i < MAX_CONNS; ++i)
-	{
-		ws_client* wsc = &state->clients[i];
-		if (!wsc->cleanup && wsc->ws_initialised)
-		{
-			if (!ev_is_active(&wsc->paired_fd_read))
-			{
-				if (buffer_length(&wsc->ws_client.wb) > 16384)
-				{
-					any_remain = true;
-				}
-				else
-				{
-					log_debug("[con-%d] unblocking socket read ws writelen=%zu\n",
-						wsc->id, buffer_length(&wsc->ws_client.wb));
-					ev_io_start(state->loop, &wsc->paired_fd_read);
-				}
-			}
-			if (!ev_is_active(&wsc->ws_client.ior))
-			{
-				if (buffer_length(&wsc->fd_writebuf) > 16384)
-				{
-					any_remain = true;
-				}
-				else
-				{
-					log_debug("[con-%d] unblocking ws read ws writelen=%zu\n",
-						wsc->id, buffer_length(&wsc->fd_writebuf));
-					ev_io_start(state->loop, &wsc->ws_client.ior);
-				}
-			}
-		}
-	}
-
-	if (!any_remain)
-	{
-		log_debug("Stopping blocked callback\n");
-		ev_idle_stop(state->loop, &state->blocked_watcher);
-	}
-}
-
 static void signal_cb(struct ev_loop* loop, ev_signal* w, int revents)
 {
 	if (w->signum == SIGINT)
@@ -387,13 +355,29 @@ static void signal_cb(struct ev_loop* loop, ev_signal* w, int revents)
 
 int main(int argc, char* argv[])
 {
+	if (getuid() == 0)
+	{
+		struct passwd* pw = getpwnam("nobody");
+		struct group* gr = getgrnam("nogroup");
+
+		if (!pw || !gr)
+		{
+			perror("Failed to get nobody:nogroup info");
+			return 1;
+		}
+		else if (setgid(gr->gr_gid) != 0 || setuid(pw->pw_uid) != 0)
+		{
+			perror("Failed to set GID/UID");
+			return 1;
+		}
+	}
+
 	ws_state state;
 	memset(&state, 0, sizeof(ws_state));
 
 	state.loop = EV_DEFAULT;
 	state.signal_watcher.data = &state;
 	state.cleanup_watcher.data = &state;
-	state.blocked_watcher.data = &state;
 	state.init_watcher.data = &state;
 	state.ping_interval = 10;
 	state.server_addr.sin_family = AF_INET;
@@ -419,9 +403,10 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 
-	log_info("WS relay: %s <-> %s:%d\n", state.ws_url, state.server_ip, ntohs(state.server_addr.sin_port));
+	log_info("WS relay: uid=%d, gid=%d: %s <-> %s:%d\n",
+		getuid(), getgid(), state.ws_url, state.server_ip,
+		ntohs(state.server_addr.sin_port));
 
-	ev_idle_init(&state.blocked_watcher, blocked_cb);
 	ev_prepare_init(&state.cleanup_watcher, cleanup_cb);
 	ev_signal_init(&state.signal_watcher, signal_cb, SIGINT);
 	ev_timer_init(&state.init_watcher, init_cb, RECONNECT_INTERVAL_SECS, 0.0);
