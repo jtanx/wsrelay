@@ -18,8 +18,8 @@ import (
 
 type WSRelay struct {
 	upgrader   websocket.Upgrader
-	conns      []*common.WebsocketConn
-	freeConns  []*common.WebsocketConn
+	conns      map[string][]*common.WebsocketConn
+	freeConns  map[string][]*common.WebsocketConn
 	mu         sync.RWMutex
 	srvCounter int
 	cliCounter int
@@ -30,31 +30,42 @@ func NewWSRelay() *WSRelay {
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: common.RWTimeout,
 		},
+		conns:     make(map[string][]*common.WebsocketConn),
+		freeConns: make(map[string][]*common.WebsocketConn),
 	}
 }
 
 func (wsr *WSRelay) GetConnections() []*common.WebsocketConn {
 	wsr.mu.RLock()
 	defer wsr.mu.RUnlock()
-	return wsr.conns
+
+	var allConnections []*common.WebsocketConn
+	for _, connList := range wsr.conns {
+		allConnections = append(allConnections, connList...)
+	}
+	return allConnections
 }
 
 func (wsr *WSRelay) RemoveConnection(conn *common.WebsocketConn) {
 	wsr.mu.Lock()
 	defer wsr.mu.Unlock()
 
-	for i, c := range wsr.freeConns {
-		if c == conn {
-			wsr.freeConns = append(wsr.freeConns[:i], wsr.freeConns[i+1:]...)
-			log.Infof("Removed conn from free list: %v", conn)
+	for fn, fc := range wsr.freeConns {
+		for i, c := range fc {
+			if c == conn {
+				wsr.freeConns[fn] = append(wsr.freeConns[fn][:i], wsr.freeConns[fn][i+1:]...)
+				log.Infof("Removed conn from free list: %v", conn)
+			}
 		}
 	}
 
-	for i, c := range wsr.conns {
-		if c == conn {
-			wsr.conns = append(wsr.conns[:i], wsr.conns[i+1:]...)
-			err := conn.Conn.Close()
-			log.Infof("Removed conn %v, err: %v", conn, err)
+	for cn, cc := range wsr.conns {
+		for i, c := range cc {
+			if c == conn {
+				wsr.conns[cn] = append(wsr.conns[cn][:i], wsr.conns[cn][i+1:]...)
+				err := conn.Conn.Close()
+				log.Infof("Removed conn %v, err: %v", conn, err)
+			}
 		}
 	}
 }
@@ -108,8 +119,9 @@ func (wsr *WSRelay) Serve(w http.ResponseWriter, r *http.Request, ps httprouter.
 		return
 	}
 
-	log.Infof("Received connection from %v (headers %v)",
-		conn.RemoteAddr().String(), r.Header)
+	path := ps.ByName("path")
+	log.Infof("Received connection from %v (path %v, headers %v)",
+		conn.RemoteAddr().String(), path, r.Header)
 	msgType, data, err := conn.ReadMessage()
 	if err != nil {
 		log.Warnf("Failed to read login: %v", err)
@@ -143,22 +155,22 @@ func (wsr *WSRelay) Serve(w http.ResponseWriter, r *http.Request, ps httprouter.
 		log.Infof("Accepted receiver conn: %v", wsConn)
 
 		common.SetPongHandler(wsConn)
-		wsr.conns = append(wsr.conns, wsConn)
-		wsr.freeConns = append(wsr.freeConns, wsConn)
+		wsr.conns[path] = append(wsr.conns[path], wsConn)
+		wsr.freeConns[path] = append(wsr.freeConns[path], wsConn)
 	} else {
 		if !totp.Validate(msg.Token, common.CliKey) {
 			log.Warnf("TOTP validation failed for client key: %v", msg.Token)
 			conn.Close()
 			return
-		} else if len(wsr.freeConns) == 0 {
+		} else if len(wsr.freeConns[path]) == 0 {
 			log.Warnf("No free conns are available, dropping client conn")
 			conn.Close()
 			return
 		}
 
 		wsr.cliCounter++
-		srvConn := wsr.freeConns[0]
-		wsr.freeConns = wsr.freeConns[1:]
+		srvConn := wsr.freeConns[path][0]
+		wsr.freeConns[path] = wsr.freeConns[path][1:]
 		wsConn := common.NewWebsocketConn(conn, "[cli-%d]", wsr.cliCounter)
 		log.Infof("Accepted client conn: %v paired with %v",
 			srvConn, wsConn)
@@ -167,7 +179,7 @@ func (wsr *WSRelay) Serve(w http.ResponseWriter, r *http.Request, ps httprouter.
 		// we haven't been reading off it in the mean time
 		srvConn.Conn.SetReadDeadline(time.Now().Add(common.RWTimeout))
 		common.SetPongHandler(wsConn)
-		wsr.conns = append(wsr.conns, wsConn)
+		wsr.conns[path] = append(wsr.conns[path], wsConn)
 
 		go wsr.RelayReads(srvConn, wsConn)
 		go wsr.RelayReads(wsConn, srvConn)
@@ -178,6 +190,7 @@ func getHandler(relay *WSRelay) http.Handler {
 	router := httprouter.New()
 	router.RedirectFixedPath = true
 	router.GET("/relay", relay.Serve)
+	router.GET("/relay/*path", relay.Serve)
 	return router
 }
 
